@@ -79,7 +79,9 @@ apiClient.interceptors.response.use(
       
       switch (status) {
         case 401:
-          toast.error('认证失败：API密钥无效');
+          // 401 错误静默处理，不显示 toast
+          // 因为首次访问时没有密钥是正常情况
+          console.log('API 认证失败，请在设置页面配置安全密钥');
           break;
         case 403:
           toast.error('访问被拒绝：权限不足');

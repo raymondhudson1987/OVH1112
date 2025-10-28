@@ -995,7 +995,7 @@ const ServersPage = () => {
       
       // 直接从后端获取数据（后端已有缓存机制）
       console.log("📡 从后端API获取服务器数据");
-      await fetchServers(true); // 等待完成，确保数据加载后再继续
+      await fetchServers(false); // false = 不强制刷新，优先使用后端缓存
       console.log("✅ 服务器数据加载完成");
     };
     
