@@ -13,7 +13,7 @@ import {
 import { Progress } from "@/components/ui/progress";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Cpu, Database, Wifi, HardDrive, CheckSquare, Square, Settings, ArrowRightLeft, Clock, Bell, Grid, List, Maximize2, Minimize2 } from "lucide-react";
+import { Cpu, Database, Wifi, HardDrive, CheckSquare, Square, Settings, ArrowRightLeft, Clock, Bell, Grid, List } from "lucide-react";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { apiEvents } from "@/context/APIContext";
 import { OVH_DATACENTERS, DatacenterInfo } from "@/config/ovhConstants"; // Import from new location
@@ -132,8 +132,7 @@ const ServersPage = () => {
     }
   });
   
-  // 显示模式：compact 或 detailed
-  const [displayMode, setDisplayMode] = useState<'compact' | 'detailed'>('detailed');
+  // 显示模式已移除，固定显示完整内容
   
   // 移动端强制使用网格视图
   useEffect(() => {
@@ -1569,16 +1568,7 @@ const ServersPage = () => {
               </div>
             )}
 
-            {/* 紧凑模式切换 - 移动端隐藏 */}
-            {!isMobile && (
-              <button
-                onClick={() => setDisplayMode(displayMode === 'compact' ? 'detailed' : 'compact')}
-                className="p-1.5 sm:p-2 bg-cyber-accent/10 hover:bg-cyber-accent/20 text-cyber-accent border border-cyber-accent/30 hover:border-cyber-accent/50 rounded-md transition-all flex-shrink-0"
-                title={displayMode === 'compact' ? '切换到详细模式' : '切换到紧凑模式'}
-              >
-                {displayMode === 'compact' ? <Maximize2 size={16} /> : <Minimize2 size={16} />}
-              </button>
-            )}
+            {/* 已移除紧凑模式切换，固定显示完整内容 */}
             
             <button
               onClick={() => fetchServers(true)}
@@ -1598,7 +1588,7 @@ const ServersPage = () => {
 
       {/* Loading state */}
       {isLoading && !hasLoadedFromCache.current ? (
-        <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-4 sm:gap-6">
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6">
           {[...Array(6)].map((_, i) => (
             <Card key={i} className="animate-pulse border-cyber-accent/30">
               <CardHeader className="bg-cyber-grid/10">
@@ -1639,13 +1629,7 @@ const ServersPage = () => {
         <>
         {/* 网格视图 */}
         {viewMode === 'grid' && (
-          <div
-            className={`grid gap-4 sm:gap-6 w-full ${
-              displayMode === 'compact'
-                ? 'grid-cols-1 lg:grid-cols-3 xl:grid-cols-4'
-                : 'grid-cols-1 lg:grid-cols-2 xl:grid-cols-3'
-            }`}
-          >
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 w-full">
             {filteredServers.map((server) => (
             <div 
               key={server.planCode}
@@ -1951,7 +1935,7 @@ const ServersPage = () => {
                   </div>
 
                   {/* 操作按钮 */}
-                  <div className="flex-shrink-0 flex gap-2">
+                  <div className="flex-shrink-0 flex flex-wrap gap-2">
                     <button
                       onClick={() => checkAvailability(server.planCode)}
                       disabled={isCheckingAvailability || !isAuthenticated}
