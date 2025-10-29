@@ -512,13 +512,41 @@ class ServerMonitor:
                     "datacenter": dc,
                     "options": options
                 }
-                # Telegram callback_data 最大64字节，使用base64编码压缩
+                # Telegram callback_data 最大64字节
                 callback_data_str = json.dumps(callback_data, ensure_ascii=False, separators=(',', ':'))
-                if len(callback_data_str.encode('utf-8')) > 60:  # 留4字节给base64前缀
-                    # 如果数据太大，使用base64编码
-                    callback_data_encoded = base64.b64encode(callback_data_str.encode('utf-8')).decode('utf-8')
-                    callback_data_final = "b64:" + callback_data_encoded[:60]  # 确保不超过64字节
+                callback_data_bytes = callback_data_str.encode('utf-8')
+                
+                # 如果原始JSON超过60字节，使用base64编码（留4字节给"b64:"前缀）
+                if len(callback_data_bytes) > 60:
+                    # 使用base64编码压缩
+                    callback_data_encoded = base64.b64encode(callback_data_bytes).decode('utf-8')
+                    # 确保 "b64:" + encoded 不超过64字节
+                    max_encoded_len = 64 - 4  # 64 - len("b64:")
+                    if len(callback_data_encoded) > max_encoded_len:
+                        # 如果base64编码后仍然太长，截断原始数据（不推荐，但总比失败好）
+                        # 优先截断options列表
+                        if len(options) > 0:
+                            callback_data_truncated = {
+                                "action": "add_to_queue",
+                                "planCode": plan_code,
+                                "datacenter": dc,
+                                "options": []  # 清空options，减少数据大小
+                            }
+                            callback_data_str = json.dumps(callback_data_truncated, ensure_ascii=False, separators=(',', ':'))
+                            callback_data_bytes = callback_data_str.encode('utf-8')
+                            callback_data_encoded = base64.b64encode(callback_data_bytes).decode('utf-8')
+                            if len(callback_data_encoded) > max_encoded_len:
+                                # 如果还是太长，直接截断JSON字符串
+                                callback_data_str = callback_data_str[:56]  # 留空间给base64编码后的扩展
+                                callback_data_bytes = callback_data_str.encode('utf-8')
+                                callback_data_encoded = base64.b64encode(callback_data_bytes).decode('utf-8')
+                                if len(callback_data_encoded) > max_encoded_len:
+                                    callback_data_encoded = callback_data_encoded[:max_encoded_len]
+                        else:
+                            callback_data_encoded = callback_data_encoded[:max_encoded_len]
+                    callback_data_final = "b64:" + callback_data_encoded
                 else:
+                    # 原始JSON小于60字节，直接使用
                     callback_data_final = callback_data_str[:64]
                 
                 row.append({

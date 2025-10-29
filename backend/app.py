@@ -2678,12 +2678,29 @@ def telegram_webhook():
             try:
                 # 检查是否是base64编码
                 if callback_data.startswith("b64:"):
-                    callback_data_decoded = base64.b64decode(callback_data[4:]).decode('utf-8')
-                    callback_data_obj = json.loads(callback_data_decoded)
+                    # 提取base64部分并解码
+                    base64_part = callback_data[4:]  # 去掉 "b64:" 前缀
+                    try:
+                        # base64解码可能会因为截断而失败，需要添加padding
+                        # base64字符串长度必须是4的倍数，不足的用'='补足
+                        missing_padding = len(base64_part) % 4
+                        if missing_padding:
+                            base64_part += '=' * (4 - missing_padding)
+                        callback_data_decoded = base64.b64decode(base64_part).decode('utf-8')
+                        callback_data_obj = json.loads(callback_data_decoded)
+                    except (base64.binascii.Error, UnicodeDecodeError, json.JSONDecodeError) as decode_error:
+                        add_log("WARNING", f"base64解码失败（可能是数据被截断）: {str(decode_error)}, base64_len={len(callback_data[4:])}", "telegram")
+                        # 如果解码失败，尝试从部分数据中提取关键信息
+                        # 这通常意味着数据在传输过程中被截断
+                        add_log("WARNING", f"callback_data（前100字符）: {callback_data[:100]}", "telegram")
+                        return jsonify({"ok": False, "error": "Callback data decoding failed (possibly truncated)"}), 400
                 else:
                     callback_data_obj = json.loads(callback_data)
+            except json.JSONDecodeError as e:
+                add_log("ERROR", f"解析callback_data JSON失败: {str(e)}, data={callback_data[:100]}", "telegram")
+                return jsonify({"ok": False, "error": "Invalid callback data format"}), 400
             except Exception as e:
-                add_log("ERROR", f"解析callback_data失败: {str(e)}, data={callback_data}", "telegram")
+                add_log("ERROR", f"解析callback_data时发生未知错误: {str(e)}, data={callback_data[:100]}", "telegram")
                 return jsonify({"ok": False, "error": "Invalid callback data"}), 400
             
             action = callback_data_obj.get("action")
