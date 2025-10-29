@@ -3578,11 +3578,12 @@ def get_os_templates(service_name):
     try:
         # 获取兼容的操作系统模板
         templates = client.get(f'/dedicated/server/{service_name}/install/compatibleTemplates')
-        add_log("INFO", f"获取服务器 {service_name} 可用系统模板成功", "server_control")
+        all_template_names = templates.get('ovh', [])
+        add_log("INFO", f"获取服务器 {service_name} 可用系统模板成功，共 {len(all_template_names)} 个", "server_control")
         
-        # 获取每个模板的详细信息
+        # 获取每个模板的详细信息（不限制数量）
         template_details = []
-        for template_name in templates.get('ovh', [])[:20]:  # 限制前20个，避免请求过多
+        for template_name in all_template_names:
             try:
                 detail = client.get(f'/dedicated/installationTemplate/{template_name}')
                 template_details.append({
@@ -3593,11 +3594,34 @@ def get_os_templates(service_name):
                     'bitFormat': detail.get('bitFormat', 64)
                 })
             except:
+                # 如果无法获取详细信息，使用模板名称
                 template_details.append({
                     'templateName': template_name,
                     'distribution': template_name,
-                    'family': 'unknown'
+                    'family': 'unknown',
+                    'bitFormat': 64
                 })
+        
+        # 按distribution排序，常用系统放前面
+        priority_order = ['debian', 'ubuntu', 'centos', 'rocky', 'almalinux', 'windows']
+        
+        def get_priority(template):
+            dist = template.get('distribution', '').lower()
+            for i, priority_dist in enumerate(priority_order):
+                if priority_dist in dist:
+                    return i
+            return len(priority_order)
+        
+        template_details.sort(key=lambda t: (get_priority(t), t.get('templateName', '')))
+        
+        # 统计Ubuntu模板
+        ubuntu_count = len([t for t in template_details if 'ubuntu' in t.get('distribution', '').lower()])
+        add_log("INFO", f"返回 {len(template_details)} 个模板 (包括 {ubuntu_count} 个Ubuntu)", "server_control")
+        
+        # 输出前10个模板用于调试
+        if len(template_details) > 0:
+            top_10 = [t.get('templateName', 'unknown') for t in template_details[:10]]
+            add_log("DEBUG", f"前10个模板: {', '.join(top_10)}", "server_control")
         
         return jsonify({
             "success": True,
@@ -3636,8 +3660,14 @@ def install_os(service_name):
             install_params['customHostname'] = data['customHostname']
             add_log("INFO", f"设置自定义主机名: {data['customHostname']}", "server_control")
         
-        # 使用默认分区配置（不传storage参数）
-        add_log("INFO", "使用默认分区配置", "server_control")
+        # 自定义存储配置 - OVH API格式的storage数组
+        if data.get('storageConfig'):
+            storage_array = data['storageConfig']
+            add_log("INFO", f"使用自定义存储配置: {json.dumps(storage_array, indent=2)}", "server_control")
+            install_params['storage'] = storage_array
+        else:
+            # 使用默认分区配置（不传storage参数）
+            add_log("INFO", "使用默认分区配置", "server_control")
         
         # 发送安装请求
         add_log("INFO", f"准备发送安装请求到OVH API", "server_control")
@@ -4703,9 +4733,106 @@ def reset_ola_configuration(service_name):
         add_log("ERROR", f"[OLA] 重置网络接口失败: {service_name} - {error_msg}", "server_control")
         return jsonify({"success": False, "error": error_msg}), 500
 
-@app.route('/api/server-control/<service_name>/partition-schemes', methods=['GET', 'OPTIONS'])
+@app.route('/api/server-control/<path:service_name>/hardware-raid-profiles', methods=['GET', 'OPTIONS'])
+def get_hardware_raid_profiles(service_name):
+    """获取硬件RAID配置信息"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+    
+    try:
+        # 获取硬件RAID配置文件
+        profiles = client.get(f'/dedicated/server/{service_name}/install/hardwareRaidProfile')
+        
+        add_log("INFO", f"获取服务器 {service_name} 硬件RAID配置成功", "server_control")
+        return jsonify({
+            "success": True,
+            "profiles": profiles,
+            "supported": True
+        })
+    except Exception as e:
+        error_msg = str(e)
+        # 如果是不支持硬件RAID，返回成功但profiles为空
+        if "not supported" in error_msg.lower():
+            add_log("INFO", f"服务器 {service_name} 不支持硬件RAID", "server_control")
+            return jsonify({
+                "success": True,
+                "profiles": [],
+                "supported": False,
+                "message": "此服务器不支持硬件RAID"
+            })
+        else:
+            add_log("ERROR", f"获取服务器 {service_name} 硬件RAID配置失败: {error_msg}", "server_control")
+            return jsonify({"success": False, "error": error_msg}), 500
+
+@app.route('/api/server-control/<path:service_name>/hardware-disk-info', methods=['GET', 'OPTIONS'])
+def get_hardware_disk_info(service_name):
+    """获取服务器硬件磁盘信息"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
+    client = get_ovh_client()
+    if not client:
+        return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401
+    
+    try:
+        # 获取硬件规格（包含磁盘信息）
+        hardware = client.get(f'/dedicated/server/{service_name}/specifications/hardware')
+        
+        # 调试：输出原始硬件信息
+        add_log("DEBUG", f"原始硬件信息: {json.dumps(hardware, indent=2)}", "server_control")
+        
+        # 提取磁盘信息
+        disk_groups = {}
+        
+        if 'diskGroups' in hardware:
+            add_log("DEBUG", f"找到 {len(hardware['diskGroups'])} 个磁盘组", "server_control")
+            for group_id, group_info in enumerate(hardware['diskGroups']):
+                add_log("DEBUG", f"磁盘组 {group_id} 原始信息: {json.dumps(group_info, indent=2)}", "server_control")
+                
+                disk_group = {
+                    'id': group_id,
+                    'raidController': group_info.get('raidController'),
+                    'disks': []
+                }
+                
+                disks_list = group_info.get('disks', [])
+                add_log("DEBUG", f"磁盘组 {group_id} 有 {len(disks_list)} 块盘", "server_control")
+                
+                for disk in disks_list:
+                    add_log("DEBUG", f"磁盘原始数据: {json.dumps(disk, indent=2)}", "server_control")
+                    
+                    disk_info = {
+                        'capacity': disk.get('capacity', {}).get('value', 0),
+                        'unit': disk.get('capacity', {}).get('unit', 'GB'),
+                        'interface': disk.get('interface'),
+                        'technology': disk.get('technology'),
+                        'number': disk.get('number', len(disk_group['disks']))
+                    }
+                    disk_group['disks'].append(disk_info)
+                
+                disk_groups[str(group_id)] = disk_group
+        
+        add_log("INFO", f"获取服务器 {service_name} 磁盘信息成功: {len(disk_groups)} 个磁盘组", "server_control")
+        return jsonify({
+            "success": True,
+            "diskGroups": disk_groups,
+            "hardware": hardware
+        })
+    except Exception as e:
+        error_msg = str(e)
+        add_log("ERROR", f"获取服务器 {service_name} 硬件磁盘信息失败: {error_msg}", "server_control")
+        return jsonify({"success": False, "error": error_msg}), 500
+
+@app.route('/api/server-control/<path:service_name>/partition-schemes', methods=['GET', 'OPTIONS'])
 def get_partition_schemes(service_name):
     """获取可用的分区方案"""
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+    
     client = get_ovh_client()
     if not client:
         return jsonify({"success": False, "error": "未配置OVH API密钥"}), 401

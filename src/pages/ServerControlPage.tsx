@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { motion, AnimatePresence } from "framer-motion";
 import { api } from "@/utils/apiClient";
 import { useToast } from "../components/ToastContainer";
-import { Server, RefreshCw, Power, HardDrive, X, AlertCircle, Activity, Cpu, Wifi, Calendar, Monitor, Mail, BarChart3 } from "lucide-react";
+import { Server, RefreshCw, Power, HardDrive, X, AlertCircle, Activity, Cpu, Wifi, Calendar, Monitor, Mail, BarChart3, Check } from "lucide-react";
 import { useIsMobile } from "@/hooks/use-mobile";
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 
@@ -77,6 +77,37 @@ interface InstallProgress {
   steps: InstallStep[];
 }
 
+interface DiskInfo {
+  capacity: number;
+  unit: string;
+  interface: string;
+  technology: string;
+  number: number;
+}
+
+interface DiskGroup {
+  id: number;
+  raidController: string;
+  disks: DiskInfo[];
+}
+
+interface HardwareRaidProfile {
+  diskGroupId: number;
+  mode: string;  // raid0, raid1, raid5, raid6, raid10
+  name: string;
+  description: string;
+}
+
+interface CustomPartition {
+  mountpoint: string;
+  filesystem: string;
+  size: number;
+  order: number;
+  raid?: string;
+  type: string;
+  diskGroupId?: number;  // 指定使用哪个磁盘组
+}
+
 const ServerControlPage: React.FC = () => {
   const isMobile = useIsMobile();
   const { showToast, showConfirm } = useToast();
@@ -87,6 +118,7 @@ const ServerControlPage: React.FC = () => {
   const [selectedServer, setSelectedServer] = useState<ServerInfo | null>(null);
   const [showReinstallDialog, setShowReinstallDialog] = useState(false);
   const [osTemplates, setOsTemplates] = useState<OSTemplate[]>([]);
+  const [templateSearchQuery, setTemplateSearchQuery] = useState(""); // 模板搜索
   const [selectedTemplate, setSelectedTemplate] = useState("");
   const [customHostname, setCustomHostname] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
@@ -94,6 +126,33 @@ const ServerControlPage: React.FC = () => {
   const [selectedScheme, setSelectedScheme] = useState("");
   const [showPartitionDetails, setShowPartitionDetails] = useState(false);
   const [loadingPartitions, setLoadingPartitions] = useState(false);
+  
+  // 磁盘配置状态
+  const [diskGroups, setDiskGroups] = useState<{ [key: string]: DiskGroup }>({});
+  const [raidProfiles, setRaidProfiles] = useState<HardwareRaidProfile[]>([]);
+  const [raidSupported, setRaidSupported] = useState(true);
+  const [useCustomStorage, setUseCustomStorage] = useState(false);
+  const [selectedRaidConfigs, setSelectedRaidConfigs] = useState<{ [diskGroupId: number]: string }>({});
+  const [customPartitions, setCustomPartitions] = useState<CustomPartition[]>([]);
+  const [loadingDiskInfo, setLoadingDiskInfo] = useState(false);
+  
+  // 软RAID配置状态
+  const [useSoftwareRaid, setUseSoftwareRaid] = useState(false);
+  const [softwareRaidLevel, setSoftwareRaidLevel] = useState<string>('raid1');
+  
+  // 分区编辑状态
+  const [showPartitionEditor, setShowPartitionEditor] = useState(false);
+  const [editingPartition, setEditingPartition] = useState<CustomPartition | null>(null);
+  const [editingPartitionIndex, setEditingPartitionIndex] = useState<number>(-1);
+  
+  // 智能配置确认对话框
+  const [showSmartConfigDialog, setShowSmartConfigDialog] = useState(false);
+  const [smartConfigInfo, setSmartConfigInfo] = useState({ 
+    groupCount: 0, 
+    diskCount: 0, 
+    scenario: '',
+    diskDetails: '' // 新增：磁盘详细信息
+  });
   
   // Task 4: 任务查看状态
   const [showTasksDialog, setShowTasksDialog] = useState(false);
@@ -233,7 +292,20 @@ const ServerControlPage: React.FC = () => {
     try {
       const response = await api.get(`/server-control/${serviceName}/templates`);
       if (response.data.success) {
-        setOsTemplates(response.data.templates);
+        const templates = response.data.templates;
+        setOsTemplates(templates);
+        
+        // 调试日志
+        console.log(`[Templates] 总共收到 ${templates.length} 个模板`);
+        const ubuntuTemplates = templates.filter((t: OSTemplate) => 
+          t.distribution.toLowerCase().includes('ubuntu') ||
+          t.templateName.toLowerCase().includes('ubuntu')
+        );
+        console.log(`[Templates] Ubuntu模板数量: ${ubuntuTemplates.length}`);
+        if (ubuntuTemplates.length > 0) {
+          console.log('[Templates] Ubuntu模板列表:', ubuntuTemplates.map((t: OSTemplate) => t.templateName));
+        }
+        console.log('[Templates] 前10个模板:', templates.slice(0, 10).map((t: OSTemplate) => t.templateName));
       }
     } catch (error: any) {
       console.error('获取模板失败:', error);
@@ -282,6 +354,159 @@ const ServerControlPage: React.FC = () => {
     }
   };
 
+  // 获取服务器磁盘信息
+  const fetchDiskInfo = async (serviceName: string) => {
+    setLoadingDiskInfo(true);
+    try {
+      const response = await api.get(`/server-control/${serviceName}/hardware-disk-info`);
+      
+      if (response.data.success) {
+        setDiskGroups(response.data.diskGroups);
+        console.log('[DiskInfo] 磁盘组信息:', response.data.diskGroups);
+        
+        // 初始化默认的RAID配置选择（默认不选择，保持空）
+        const defaultConfigs: { [diskGroupId: number]: string } = {};
+        Object.keys(response.data.diskGroups).forEach(groupId => {
+          defaultConfigs[parseInt(groupId)] = '';
+        });
+        setSelectedRaidConfigs(defaultConfigs);
+      }
+    } catch (error: any) {
+      console.error('[DiskInfo] 获取磁盘信息失败:', error);
+      showToast({ 
+        type: 'error', 
+        title: '获取磁盘信息失败',
+        message: error.response?.data?.error || error.message 
+      });
+    } finally {
+      setLoadingDiskInfo(false);
+    }
+  };
+
+  // 获取硬件RAID配置文件
+  const fetchRaidProfiles = async (serviceName: string) => {
+    try {
+      const response = await api.get(`/server-control/${serviceName}/hardware-raid-profiles`);
+      
+      if (response.data.success) {
+        setRaidProfiles(response.data.profiles);
+        console.log('[RAID] RAID配置文件:', response.data.profiles);
+        
+        // 设置RAID支持状态
+        if (response.data.supported === false) {
+          setRaidSupported(false);
+          console.log('[RAID] 此服务器不支持硬件RAID');
+        } else {
+          setRaidSupported(true);
+        }
+      }
+    } catch (error: any) {
+      console.error('[RAID] 获取RAID配置失败:', error);
+      // 某些服务器可能不支持硬件RAID，不显示错误提示
+      console.log('[RAID] 服务器可能不支持硬件RAID或配置为空');
+      setRaidProfiles([]);
+      setRaidSupported(false);
+    }
+  };
+
+  // 智能配置：根据磁盘组自动生成最佳方案
+  const applySmartConfig = () => {
+    const diskGroupsArray = Object.entries(diskGroups);
+    const groupCount = diskGroupsArray.length;
+    
+    if (groupCount === 0) {
+      showToast({ type: 'warning', title: '未检测到磁盘组' });
+      return;
+    }
+
+    // 清空现有配置
+    setCustomPartitions([]);
+    setSelectedRaidConfigs({});
+    setUseCustomStorage(true);
+    setUseSoftwareRaid(false);
+
+    if (groupCount === 1) {
+      // 单磁盘组：检查盘数
+      const [groupId, group] = diskGroupsArray[0];
+      const diskCount = group.disks.length;
+      
+      if (diskCount === 1) {
+        // 单盘：使用默认分区，无RAID
+        showToast({ 
+          type: 'success', 
+          title: '已应用智能配置',
+          message: '单磁盘 - 默认系统分区（无RAID）'
+        });
+        
+        // 不设置自定义配置，使用默认
+        setUseCustomStorage(false);
+        
+      } else {
+        // 多盘（如4x2TB）：配置RAID0系统盘
+        const totalCapacity = diskCount * (group.disks[0]?.capacity || 0);
+        const capacityUnit = group.disks[0]?.unit || 'GB';
+        
+        // 系统盘分区（使用RAID0）
+        const systemPartitions: CustomPartition[] = [
+          {
+            mountpoint: '/boot',
+            filesystem: 'ext4',
+            size: 1024,
+            order: 1,
+            type: 'primary',
+            diskGroupId: parseInt(groupId),
+            raid: 'raid1'  // /boot使用RAID1保证安全
+          },
+          {
+            mountpoint: 'swap',
+            filesystem: 'swap',
+            size: 8192,
+            order: 2,
+            type: 'primary',
+            diskGroupId: parseInt(groupId)
+            // swap分区不设置RAID（OVH不允许swap使用RAID0）
+          },
+          {
+            mountpoint: '/',
+            filesystem: 'ext4',
+            size: 0,
+            order: 3,
+            type: 'primary',
+            diskGroupId: parseInt(groupId),
+            raid: 'raid0'  // 根分区RAID0（最大容量和性能）
+          }
+        ];
+        
+        setCustomPartitions(systemPartitions);
+        
+        // 如果支持硬件RAID，配置硬件RAID0
+        if (raidSupported) {
+          setSelectedRaidConfigs({
+            [parseInt(groupId)]: 'raid0'
+          });
+        }
+        
+        showToast({ 
+          type: 'success', 
+          title: '已应用智能配置',
+          message: `${diskCount}x${group.disks[0]?.capacity}${capacityUnit} → RAID0系统盘（约${totalCapacity}${capacityUnit}可用）`
+        });
+      }
+      
+      } else if (groupCount >= 2) {
+        // 多磁盘组：OVH API不支持！
+        showToast({ 
+          type: 'error', 
+          title: 'OVH API限制',
+          message: '多磁盘组服务器不支持自定义分区配置，请使用默认分区'
+        });
+        setUseCustomStorage(false);
+        return;
+      }
+    
+    setShowSmartConfigDialog(false);
+  };
+
   // Task 3: 打开重装对话框（先检查是否有正在进行的安装）
   const openReinstallDialog = async (server: ServerInfo) => {
     setSelectedServer(server);
@@ -322,12 +547,25 @@ const ServerControlPage: React.FC = () => {
     
     // 没有正在进行的安装，正常打开重装对话框
     setSelectedTemplate("");
+    setTemplateSearchQuery(""); // 重置搜索框
     setCustomHostname("");
     setPartitionSchemes([]);
     setSelectedScheme("");
     setShowPartitionDetails(false);
+    setUseCustomStorage(false);
+    setSelectedRaidConfigs({});
+    setCustomPartitions([]);
+    setRaidSupported(true); // 重置RAID支持状态，将在API调用后更新
+    setUseSoftwareRaid(false); // 重置软RAID状态
+    setSoftwareRaidLevel('raid1'); // 重置为默认RAID 1
     setShowReinstallDialog(true);
-    await fetchOSTemplates(server.serviceName);
+    
+    // 并行加载OS模板和磁盘信息
+    await Promise.all([
+      fetchOSTemplates(server.serviceName),
+      fetchDiskInfo(server.serviceName),
+      fetchRaidProfiles(server.serviceName)
+    ]);
   };
 
   // Task 3: 重装系统
@@ -353,12 +591,106 @@ const ServerControlPage: React.FC = () => {
         customHostname: customHostname || undefined
       };
       
-      // 如果用户选择了分区方案，传递给后端
-      if (selectedScheme) {
+      // 如果用户启用了自定义存储配置或软RAID
+      if (useCustomStorage || useSoftwareRaid) {
+        // 按磁盘组分组配置
+        const diskGroupConfigs: Map<number, any> = new Map();
+        
+        // 处理自定义分区
+        let partitions = customPartitions;
+        
+        // 如果启用了软RAID但没有自定义分区，生成默认软RAID分区
+        if (useSoftwareRaid && customPartitions.length === 0) {
+          partitions = [
+            {
+              mountpoint: '/',
+              filesystem: 'ext4',
+              size: 0,
+              order: 1,
+              type: 'primary',
+              raid: softwareRaidLevel,
+              diskGroupId: 0
+            }
+          ];
+          console.log('[Install] 使用默认软RAID分区:', partitions);
+        }
+        
+        // 按磁盘组分组分区
+        partitions.forEach(partition => {
+          const groupId = partition.diskGroupId !== undefined ? partition.diskGroupId : 0;
+          
+          if (!diskGroupConfigs.has(groupId)) {
+            diskGroupConfigs.set(groupId, {
+              diskGroupId: groupId,
+              partitioning: {
+                layout: []
+              }
+            });
+          }
+          
+          const config = diskGroupConfigs.get(groupId);
+          
+          // 转换分区格式为OVH API格式
+          const ovhPartition: any = {
+            mountPoint: partition.mountpoint,
+            fileSystem: partition.filesystem,
+            size: partition.size || 0
+          };
+          
+          // 添加软RAID级别（如果有）
+          if (partition.raid) {
+            // 将 'raid0' 转换为数字 0
+            const raidMatch = partition.raid.match(/raid(\d+)/);
+            if (raidMatch) {
+              ovhPartition.raidLevel = parseInt(raidMatch[1]);
+            }
+          }
+          
+          config.partitioning.layout.push(ovhPartition);
+        });
+        
+        // 添加硬件RAID配置
+        Object.entries(selectedRaidConfigs).forEach(([diskGroupId, raidMode]) => {
+          if (raidMode) {
+            const groupId = parseInt(diskGroupId);
+            
+            if (!diskGroupConfigs.has(groupId)) {
+              diskGroupConfigs.set(groupId, {
+                diskGroupId: groupId
+              });
+            }
+            
+            const config = diskGroupConfigs.get(groupId);
+            
+            // OVH硬件RAID格式
+            if (!config.hardwareRaid) {
+              config.hardwareRaid = [];
+            }
+            
+            // 将 'raid0' 转换为 '0'
+            const raidLevel = raidMode.replace('raid', '');
+            config.hardwareRaid.push({
+              disks: diskGroups[groupId]?.disks?.map((d: any) => d.number) || [],
+              mode: raidLevel,
+              name: `raid${raidLevel}`,
+              step: 1
+            });
+          }
+        });
+        
+        // 转换为数组
+        const storageArray = Array.from(diskGroupConfigs.values());
+        
+        if (storageArray.length > 0) {
+          installData.storageConfig = storageArray;
+          console.log('[Install] 使用自定义存储配置:', JSON.stringify(storageArray, null, 2));
+        }
+      } else if (selectedScheme) {
+        // 如果用户选择了分区方案（旧方式），传递给后端
         installData.partitionSchemeName = selectedScheme;
         console.log('[Install] 使用自定义分区方案:', selectedScheme);
       } else {
-        console.log('[Install] 未选择分区方案，将使用默认分区');
+        console.log('[Install] 使用默认分区');
       }
       
       console.log('[Install] 安装数据:', installData);
@@ -373,7 +705,7 @@ const ServerControlPage: React.FC = () => {
       }
     } catch (error: any) {
       console.error('重装失败:', error);
-      showToast({ type: 'error', title: '重装系统失败' });
+      showToast({ type: 'error', title: '重装系统失败', message: error.response?.data?.error || error.message });
     } finally {
       setIsProcessing(false);
     }
@@ -1814,6 +2146,27 @@ const ServerControlPage: React.FC = () => {
               <div className="space-y-4">
                 <div>
                   <label className="block text-cyber-text font-medium mb-2">操作系统模板</label>
+                  
+                  {/* 搜索框 */}
+                  <div className="mb-3">
+                    <input
+                      type="text"
+                      placeholder="搜索系统模板... (如: ubuntu, debian, centos)"
+                      value={templateSearchQuery}
+                      onChange={(e) => setTemplateSearchQuery(e.target.value)}
+                      className="w-full px-4 py-2.5 bg-cyber-bg border border-cyber-accent/30 rounded-lg text-cyber-text placeholder-cyber-muted focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/30 transition-all"
+                    />
+                    {templateSearchQuery && (
+                      <p className="text-xs text-cyber-muted mt-1">
+                        找到 {osTemplates.filter(t => 
+                          t.distribution.toLowerCase().includes(templateSearchQuery.toLowerCase()) ||
+                          t.templateName.toLowerCase().includes(templateSearchQuery.toLowerCase()) ||
+                          t.family.toLowerCase().includes(templateSearchQuery.toLowerCase())
+                        ).length} 个匹配的模板
+                      </p>
+                    )}
+                  </div>
+                  
                   <select
                     value={selectedTemplate}
                     onChange={(e) => {
@@ -1825,18 +2178,26 @@ const ServerControlPage: React.FC = () => {
                       background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 41, 59, 0.95) 100%)'
                     }}>
                     <option value="" className="bg-cyber-bg text-cyber-muted">选择系统模板</option>
-                    {osTemplates.map((template) => (
-                      <option 
-                        key={template.templateName} 
-                        value={template.templateName}
-                        className="bg-cyber-bg text-cyber-text hover:bg-cyber-accent/20 py-2"
-                        style={{
-                          background: 'rgba(15, 23, 42, 0.98)',
-                          padding: '8px 12px'
-                        }}>
-                        {template.distribution} - {template.family} - {template.bitFormat}位
-                      </option>
-                    ))}
+                    {osTemplates
+                      .filter(template => {
+                        if (!templateSearchQuery) return true;
+                        const query = templateSearchQuery.toLowerCase();
+                        return template.distribution.toLowerCase().includes(query) ||
+                               template.templateName.toLowerCase().includes(query) ||
+                               template.family.toLowerCase().includes(query);
+                      })
+                      .map((template) => (
+                        <option 
+                          key={template.templateName} 
+                          value={template.templateName}
+                          className="bg-cyber-bg text-cyber-text hover:bg-cyber-accent/20 py-2"
+                          style={{
+                            background: 'rgba(15, 23, 42, 0.98)',
+                            padding: '8px 12px'
+                          }}>
+                          {template.distribution} - {template.family} - {template.bitFormat}位
+                        </option>
+                      ))}
                   </select>
                 </div>
 
@@ -1852,6 +2213,330 @@ const ServerControlPage: React.FC = () => {
                       background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.95) 0%, rgba(30, 41, 59, 0.95) 100%)'
                     }}
                   />
+                </div>
+
+                {/* 高级存储配置 */}
+                <div className="border-t border-cyber-accent/30 pt-4">
+                  <div className="flex items-center justify-between mb-3">
+                    <label className="flex items-center gap-2 text-cyber-text font-medium cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={useCustomStorage}
+                        onChange={(e) => setUseCustomStorage(e.target.checked)}
+                        className="w-4 h-4 accent-cyan-500"
+                      />
+                      <HardDrive className="w-4 h-4 text-cyan-400" />
+                      <span>启用高级存储配置（RAID & 分区）</span>
+                    </label>
+                    
+                    {/* 智能配置按钮 */}
+                    {Object.keys(diskGroups).length > 0 && (
+                      <button
+                        onClick={() => {
+                          const diskGroupsArray = Object.entries(diskGroups);
+                          const groupCount = diskGroupsArray.length;
+                          const diskCount = diskGroupsArray[0]?.[1]?.disks?.length || 0;
+                          
+                          // 生成磁盘详细信息
+                          console.log('[SmartConfig] 完整磁盘组数据:', diskGroups);
+                          console.log('[SmartConfig] entries后:', diskGroupsArray);
+                          
+                          let diskDetails = '';
+                          diskGroupsArray.forEach(([groupId, group]) => {
+                            console.log(`[SmartConfig] 磁盘组${groupId}:`, group);
+                            
+                            const disks = group.disks || [];
+                            if (disks.length === 0) {
+                              diskDetails += `磁盘组${groupId}: 无磁盘信息\n`;
+                              return;
+                            }
+                            
+                            const firstDisk = disks[0];
+                            console.log(`[SmartConfig] 磁盘组${groupId} 第一块盘:`, firstDisk);
+                            console.log(`[SmartConfig] capacity:`, firstDisk?.capacity, 'unit:', firstDisk?.unit);
+                            
+                            const diskSize = firstDisk?.capacity || '???';
+                            const diskUnit = firstDisk?.unit || 'GB';
+                            const diskType = firstDisk?.technology || firstDisk?.interface || '';
+                            
+                            diskDetails += `磁盘组${groupId}: ${disks.length}×${diskSize}${diskUnit} ${diskType}\n`;
+                          });
+                          
+                          let scenarioText = '';
+                          if (groupCount === 1 && diskCount === 1) {
+                            scenarioText = '单磁盘：默认系统分区（无RAID）';
+                          } else if (groupCount === 1 && diskCount > 1) {
+                            scenarioText = `单磁盘组多盘（${diskCount}盘）：RAID0系统盘（最大容量）`;
+                          } else {
+                            scenarioText = '⚠️ 多磁盘组不支持自定义分区（OVH API限制）';
+                          }
+                          
+                          setSmartConfigInfo({ groupCount, diskCount, scenario: scenarioText, diskDetails });
+                          setShowSmartConfigDialog(true);
+                        }}
+                        className="px-3 py-1.5 bg-gradient-to-r from-purple-500 to-pink-500 text-white text-sm rounded-lg hover:from-purple-600 hover:to-pink-600 transition-all flex items-center gap-2 shadow-lg">
+                        <Activity className="w-4 h-4" />
+                        智能配置
+                      </button>
+                    )}
+                  </div>
+
+                  {useCustomStorage && (
+                    <motion.div
+                      initial={{ opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: 'auto' }}
+                      exit={{ opacity: 0, height: 0 }}
+                      className="space-y-4 bg-cyber-grid/30 rounded-lg p-4 border border-cyan-500/30">
+                      
+                      {/* 磁盘信息展示 */}
+                      {loadingDiskInfo ? (
+                        <div className="text-center py-4 text-cyber-muted">
+                          <RefreshCw className="w-5 h-5 animate-spin mx-auto mb-2" />
+                          <p>加载磁盘信息中...</p>
+                        </div>
+                      ) : Object.keys(diskGroups).length === 0 ? (
+                        <div className="text-center py-4 text-cyber-muted">
+                          <AlertCircle className="w-5 h-5 mx-auto mb-2" />
+                          <p>未检测到磁盘组信息</p>
+                        </div>
+                      ) : (
+                        <div className="space-y-4">
+                          <h4 className="text-sm font-semibold text-cyber-text mb-2">磁盘组配置</h4>
+                          
+                          {Object.entries(diskGroups).map(([groupId, group]) => (
+                            <div key={groupId} className="bg-cyber-bg/50 rounded-lg p-3 border border-cyan-500/20">
+                              <div className="flex items-center gap-2 mb-2">
+                                <HardDrive className="w-4 h-4 text-cyan-400" />
+                                <span className="text-sm font-semibold text-cyber-text">
+                                  磁盘组 {groupId}
+                                </span>
+                                {group.raidController && (
+                                  <span className="text-xs text-cyan-400 bg-cyan-500/10 px-2 py-0.5 rounded">
+                                    {group.raidController}
+                                  </span>
+                                )}
+                              </div>
+                              
+                              {/* 磁盘列表 */}
+                              <div className="grid grid-cols-2 gap-2 mb-3 text-xs">
+                                {group.disks.map((disk, idx) => (
+                                  <div key={idx} className="flex items-center gap-1 text-cyber-muted">
+                                    <div className="w-2 h-2 rounded-full bg-cyan-400"></div>
+                                    <span>
+                                      {disk.capacity}{disk.unit} {disk.technology || ''} {disk.interface || ''}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+
+                              {/* 硬件RAID模式选择 */}
+                              <div>
+                                <label className="block text-xs text-cyber-muted mb-1">硬件RAID模式</label>
+                                {!raidSupported ? (
+                                  <div className="bg-yellow-500/10 border border-yellow-500/30 rounded p-2">
+                                    <p className="text-xs text-yellow-400 mb-2">
+                                      此服务器不支持硬件RAID配置
+                                    </p>
+                                    {!useSoftwareRaid && (
+                                      <button
+                                        onClick={() => setUseSoftwareRaid(true)}
+                                        className="text-xs px-2 py-1 bg-purple-500/20 border border-purple-500/30 rounded text-purple-400 hover:bg-purple-500/30">
+                                        改用软RAID →
+                                      </button>
+                                    )}
+                                  </div>
+                                ) : (
+                                  <select
+                                    value={selectedRaidConfigs[parseInt(groupId)] || ''}
+                                    onChange={(e) => {
+                                      setSelectedRaidConfigs({
+                                        ...selectedRaidConfigs,
+                                        [parseInt(groupId)]: e.target.value
+                                      });
+                                    }}
+                                    className="w-full px-3 py-2 bg-cyber-dark border border-cyan-500/30 rounded text-cyber-text text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30">
+                                    <option value="">默认（无RAID）</option>
+                                    <option value="raid0">RAID 0 - 条带化（性能优先，无冗余）</option>
+                                    <option value="raid1">RAID 1 - 镜像（冗余优先）</option>
+                                    <option value="raid5">RAID 5 - 分布式奇偶校验（平衡）</option>
+                                    <option value="raid6">RAID 6 - 双重奇偶校验（高冗余）</option>
+                                    <option value="raid10">RAID 10 - 镜像+条带化（高性能+冗余）</option>
+                                  </select>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+
+                          {/* 软RAID配置 */}
+                          <div className="border-t border-cyan-500/20 pt-4 mt-4">
+                            <div className="flex items-center justify-between mb-3">
+                              <label className="flex items-center gap-2 text-cyber-text font-medium cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={useSoftwareRaid}
+                                  onChange={(e) => setUseSoftwareRaid(e.target.checked)}
+                                  className="w-4 h-4 accent-purple-500"
+                                />
+                                <HardDrive className="w-4 h-4 text-purple-400" />
+                                <span className="text-sm">使用软RAID（Software RAID）</span>
+                              </label>
+                            </div>
+
+                            {useSoftwareRaid && (
+                              <motion.div
+                                initial={{ opacity: 0, height: 0 }}
+                                animate={{ opacity: 1, height: 'auto' }}
+                                exit={{ opacity: 0, height: 0 }}
+                                className="space-y-3 bg-purple-500/10 rounded-lg p-3 border border-purple-500/30">
+                                <p className="text-xs text-purple-300">
+                                  软RAID通过操作系统层面实现，不需要硬件RAID控制器，适用于所有服务器。
+                                </p>
+                                
+                                <div>
+                                  <label className="block text-xs text-cyber-muted mb-1">软RAID级别</label>
+                                  <select
+                                    value={softwareRaidLevel}
+                                    onChange={(e) => setSoftwareRaidLevel(e.target.value)}
+                                    className="w-full px-3 py-2 bg-cyber-dark border border-purple-500/30 rounded text-cyber-text text-sm focus:border-purple-500 focus:ring-1 focus:ring-purple-500/30">
+                                    <option value="raid0">RAID 0 - 条带化（性能优先，2+磁盘）</option>
+                                    <option value="raid1">RAID 1 - 镜像（推荐，2+磁盘）</option>
+                                    <option value="raid5">RAID 5 - 分布式奇偶校验（3+磁盘）</option>
+                                    <option value="raid6">RAID 6 - 双重奇偶校验（4+磁盘）</option>
+                                    <option value="raid10">RAID 10 - 镜像+条带化（4+磁盘）</option>
+                                  </select>
+                                </div>
+
+                                <div className="bg-purple-500/10 border border-purple-500/30 rounded p-2 text-xs text-purple-300">
+                                  <div className="flex items-start gap-2">
+                                    <AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" />
+                                    <div>
+                                      <p className="font-semibold mb-1">软RAID说明：</p>
+                                      <ul className="list-disc list-inside space-y-0.5">
+                                        <li>软RAID由Linux mdadm管理，性能略低于硬件RAID</li>
+                                        <li>适用于不支持硬件RAID的服务器</li>
+                                        <li>RAID 1推荐用于系统盘（数据安全）</li>
+                                        <li>RAID 0适合临时数据（最大性能和容量）</li>
+                                        <li>所有磁盘将自动加入软RAID阵列</li>
+                                      </ul>
+                                    </div>
+                                  </div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </div>
+
+                          {/* 分区配置 */}
+                          <div className="border-t border-cyan-500/20 pt-4 mt-4">
+                            <h4 className="text-sm font-semibold text-cyber-text mb-2">自定义分区方案（可选）</h4>
+                            <p className="text-xs text-cyber-muted mb-3">
+                              留空则使用默认分区方案。点击下方按钮添加自定义分区。
+                            </p>
+                            
+                            {customPartitions.length > 0 && (
+                              <div className="space-y-2 mb-3">
+                                {customPartitions.map((partition, idx) => (
+                                  <div key={idx} className="flex items-center gap-2 bg-cyber-dark/50 rounded p-2 text-xs">
+                                    <span className="text-cyan-400 font-mono">{partition.mountpoint}</span>
+                                    <span className="text-cyber-muted">|</span>
+                                    <span className="text-cyber-muted">{partition.filesystem}</span>
+                                    <span className="text-cyber-muted">|</span>
+                                    <span className="text-cyber-muted">{partition.size === 0 ? '剩余空间' : `${partition.size}MB`}</span>
+                                    {partition.diskGroupId !== undefined && (
+                                      <>
+                                        <span className="text-cyber-muted">|</span>
+                                        <span className="text-cyan-400">磁盘组{partition.diskGroupId}</span>
+                                      </>
+                                    )}
+                                    {partition.raid && (
+                                      <>
+                                        <span className="text-cyber-muted">|</span>
+                                        <span className="text-purple-400">{partition.raid.toUpperCase()}</span>
+                                      </>
+                                    )}
+                                    <button
+                                      onClick={() => {
+                                        setEditingPartition(partition);
+                                        setEditingPartitionIndex(idx);
+                                        setShowPartitionEditor(true);
+                                      }}
+                                      className="ml-auto text-blue-400 hover:text-blue-300">
+                                      编辑
+                                    </button>
+                                    <button
+                                      onClick={() => setCustomPartitions(customPartitions.filter((_, i) => i !== idx))}
+                                      className="text-red-400 hover:text-red-300">
+                                      <X className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+
+                            <div className="flex gap-2">
+                              <button
+                                onClick={() => {
+                                  // 添加默认分区，如果启用了软RAID则包含raid参数
+                                  const newPartition: CustomPartition = {
+                                    mountpoint: '/',
+                                    filesystem: 'ext4',
+                                    size: 50000,
+                                    order: customPartitions.length + 1,
+                                    type: 'primary'
+                                  };
+                                  
+                                  // 如果启用软RAID，添加raid参数
+                                  if (useSoftwareRaid) {
+                                    newPartition.raid = softwareRaidLevel;
+                                  }
+                                  
+                                  setCustomPartitions([...customPartitions, newPartition]);
+                                }}
+                                className="text-xs px-3 py-1.5 bg-cyan-500/20 border border-cyan-500/30 rounded text-cyan-400 hover:bg-cyan-500/30">
+                                + 快速添加 {useSoftwareRaid && `(${softwareRaidLevel.toUpperCase()})`}
+                              </button>
+                              
+                              <button
+                                onClick={() => {
+                                  // 打开高级编辑器
+                                  setEditingPartition({
+                                    mountpoint: '/',
+                                    filesystem: 'ext4',
+                                    size: 0,
+                                    order: customPartitions.length + 1,
+                                    type: 'primary',
+                                    raid: useSoftwareRaid ? softwareRaidLevel : undefined,
+                                    diskGroupId: Object.keys(diskGroups).length > 0 ? parseInt(Object.keys(diskGroups)[0]) : undefined
+                                  });
+                                  setEditingPartitionIndex(-1);
+                                  setShowPartitionEditor(true);
+                                }}
+                                className="text-xs px-3 py-1.5 bg-green-500/20 border border-green-500/30 rounded text-green-400 hover:bg-green-500/30">
+                                ⚙️ 高级添加
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* 提示信息 */}
+                          <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-lg p-3">
+                            <div className="flex items-start gap-2">
+                              <AlertCircle className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
+                              <div className="text-xs text-cyan-300">
+                                <p className="font-semibold mb-1">高级存储配置说明：</p>
+                                <ul className="list-disc list-inside space-y-0.5">
+                                  <li><strong>硬件RAID</strong>：由RAID控制器管理，性能最佳</li>
+                                  <li><strong>软RAID</strong>：由操作系统管理，适用于所有服务器</li>
+                                  <li>RAID 0: 所有磁盘条带化，无冗余，最大容量和性能</li>
+                                  <li>RAID 1: 磁盘镜像，50%可用容量，完整冗余（推荐）</li>
+                                  <li>RAID 5: 分布式奇偶校验，(n-1)磁盘容量，1个磁盘冗余</li>
+                                  <li>自定义分区为高级功能，请谨慎使用</li>
+                                </ul>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
+                    </motion.div>
+                  )}
                 </div>
 
                 <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-4">
@@ -1888,6 +2573,168 @@ const ServerControlPage: React.FC = () => {
         )}
       </AnimatePresence>,
       document.body
+      )}
+
+      {/* 分区编辑器对话框 */}
+      {createPortal(
+        <AnimatePresence>
+          {showPartitionEditor && editingPartition && (
+            <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[60] p-2 sm:p-4">
+              <motion.div
+                initial={{ opacity: 0, scale: 0.95 }}
+                animate={{ opacity: 1, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95 }}
+                className="cyber-card max-w-lg w-full max-h-[90vh] overflow-y-auto">
+                <div className="flex items-center justify-between mb-4">
+                  <h3 className="text-lg font-semibold text-cyber-text">
+                    {editingPartitionIndex === -1 ? '添加分区' : '编辑分区'}
+                  </h3>
+                  <button
+                    onClick={() => {
+                      setShowPartitionEditor(false);
+                      setEditingPartition(null);
+                      setEditingPartitionIndex(-1);
+                    }}
+                    className="text-cyber-muted hover:text-cyber-text transition-colors">
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+
+                <div className="space-y-3">
+                  {/* 挂载点 */}
+                  <div>
+                    <label className="block text-xs text-cyber-muted mb-1">挂载点</label>
+                    <input
+                      type="text"
+                      value={editingPartition.mountpoint}
+                      onChange={(e) => setEditingPartition({...editingPartition, mountpoint: e.target.value})}
+                      placeholder="例如: / 或 /home 或 swap"
+                      className="w-full px-3 py-2 bg-cyber-dark border border-cyan-500/30 rounded text-cyber-text text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30"
+                    />
+                  </div>
+
+                  {/* 文件系统 */}
+                  <div>
+                    <label className="block text-xs text-cyber-muted mb-1">文件系统</label>
+                    <select
+                      value={editingPartition.filesystem}
+                      onChange={(e) => setEditingPartition({...editingPartition, filesystem: e.target.value})}
+                      className="w-full px-3 py-2 bg-cyber-dark border border-cyan-500/30 rounded text-cyber-text text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30">
+                      <option value="ext4">ext4</option>
+                      <option value="ext3">ext3</option>
+                      <option value="xfs">xfs</option>
+                      <option value="btrfs">btrfs</option>
+                      <option value="swap">swap</option>
+                    </select>
+                  </div>
+
+                  {/* 大小 */}
+                  <div>
+                    <label className="block text-xs text-cyber-muted mb-1">大小（MB，0=使用剩余空间）</label>
+                    <input
+                      type="number"
+                      value={editingPartition.size}
+                      onChange={(e) => setEditingPartition({...editingPartition, size: parseInt(e.target.value) || 0})}
+                      className="w-full px-3 py-2 bg-cyber-dark border border-cyan-500/30 rounded text-cyber-text text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30"
+                    />
+                  </div>
+
+                  {/* 磁盘组选择 */}
+                  {Object.keys(diskGroups).length > 1 && (
+                    <div>
+                      <label className="block text-xs text-cyber-muted mb-1">磁盘组（指定分区使用哪个磁盘组）</label>
+                      <select
+                        value={editingPartition.diskGroupId ?? ''}
+                        onChange={(e) => setEditingPartition({
+                          ...editingPartition, 
+                          diskGroupId: e.target.value ? parseInt(e.target.value) : undefined
+                        })}
+                        className="w-full px-3 py-2 bg-cyber-dark border border-cyan-500/30 rounded text-cyber-text text-sm focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500/30">
+                        <option value="">自动选择</option>
+                        {Object.entries(diskGroups).map(([groupId, group]) => (
+                          <option key={groupId} value={groupId}>
+                            磁盘组 {groupId} ({group.disks.length}x{group.disks[0]?.capacity}{group.disks[0]?.unit} {group.disks[0]?.technology})
+                          </option>
+                        ))}
+                      </select>
+                      <p className="text-xs text-cyan-400 mt-1">
+                        用于配置多磁盘组场景（如NVMe系统盘 + HDD数据盘）
+                      </p>
+                    </div>
+                  )}
+
+                  {/* 软RAID级别 */}
+                  {(useSoftwareRaid || editingPartition.raid) && (
+                    <div>
+                      <label className="block text-xs text-cyber-muted mb-1">软RAID级别</label>
+                      <select
+                        value={editingPartition.raid ?? ''}
+                        onChange={(e) => setEditingPartition({
+                          ...editingPartition, 
+                          raid: e.target.value || undefined
+                        })}
+                        className="w-full px-3 py-2 bg-cyber-dark border border-purple-500/30 rounded text-cyber-text text-sm focus:border-purple-500 focus:ring-1 focus:ring-purple-500/30">
+                        <option value="">不使用RAID</option>
+                        <option value="raid0">RAID 0 - 条带化</option>
+                        <option value="raid1">RAID 1 - 镜像</option>
+                        <option value="raid5">RAID 5 - 奇偶校验</option>
+                        <option value="raid6">RAID 6 - 双重奇偶校验</option>
+                        <option value="raid10">RAID 10 - 镜像+条带化</option>
+                      </select>
+                    </div>
+                  )}
+
+                  {/* 提示 */}
+                  <div className="bg-blue-500/10 border border-blue-500/30 rounded p-2 text-xs text-blue-300">
+                    <div className="flex items-start gap-2">
+                      <AlertCircle className="w-3 h-3 flex-shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-semibold mb-1">分区配置提示：</p>
+                        <ul className="list-disc list-inside space-y-0.5">
+                          <li>挂载点: 根分区使用 /，交换分区使用 swap</li>
+                          <li>大小: 设置为 0 将使用所有剩余空间</li>
+                          <li>磁盘组: 多磁盘组时可指定分区位置（如系统盘 vs 数据盘）</li>
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* 操作按钮 */}
+                <div className="flex justify-end gap-3 mt-4">
+                  <button
+                    onClick={() => {
+                      setShowPartitionEditor(false);
+                      setEditingPartition(null);
+                      setEditingPartitionIndex(-1);
+                    }}
+                    className="px-4 py-2 bg-cyber-grid/50 border border-cyber-accent/30 rounded text-cyber-text hover:bg-cyber-accent/10">
+                    取消
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (editingPartitionIndex === -1) {
+                        // 添加新分区
+                        setCustomPartitions([...customPartitions, editingPartition]);
+                      } else {
+                        // 更新现有分区
+                        const newPartitions = [...customPartitions];
+                        newPartitions[editingPartitionIndex] = editingPartition;
+                        setCustomPartitions(newPartitions);
+                      }
+                      setShowPartitionEditor(false);
+                      setEditingPartition(null);
+                      setEditingPartitionIndex(-1);
+                    }}
+                    className="px-4 py-2 bg-cyan-500 text-white rounded hover:bg-cyan-600">
+                    确认
+                  </button>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>,
+        document.body
       )}
 
       {/* Task 4: 任务列表对话框 */}
@@ -2661,6 +3508,119 @@ const ServerControlPage: React.FC = () => {
                       {loadingChangeContact && <RefreshCw className="w-4 h-4 animate-spin" />}
                       提交变更
                     </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>,
+        document.body
+      )}
+
+      {/* 智能配置确认对话框 */}
+      {createPortal(
+        <AnimatePresence>
+          {showSmartConfigDialog && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+              {/* 背景遮罩 */}
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                onClick={() => setShowSmartConfigDialog(false)}
+                className="absolute inset-0 bg-black/60 backdrop-blur-sm"
+              />
+
+              {/* 对话框内容 */}
+              <motion.div
+                initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                animate={{ opacity: 1, scale: 1, y: 0 }}
+                exit={{ opacity: 0, scale: 0.9, y: 20 }}
+                className="relative bg-gradient-to-br from-cyber-bg via-cyber-grid to-cyber-bg border border-cyber-accent rounded-xl shadow-2xl max-w-md w-full overflow-hidden">
+                
+                {/* 顶部装饰线 */}
+                <div className="h-1 bg-gradient-to-r from-cyan-500 via-purple-500 to-pink-500" />
+                
+                <div className="p-6">
+                  {/* 标题 */}
+                  <div className="flex items-center gap-3 mb-4">
+                    <div className="p-2 bg-gradient-to-r from-purple-500/20 to-pink-500/20 rounded-lg">
+                      <Activity className="w-6 h-6 text-purple-400" />
+                    </div>
+                    <h3 className="text-xl font-bold text-transparent bg-clip-text bg-gradient-to-r from-cyan-400 to-purple-400">
+                      智能配置将根据磁盘组自动生成最佳方案：
+                    </h3>
+                  </div>
+
+                  {/* 磁盘信息 */}
+                  <div className="bg-purple-500/10 border border-purple-500/30 rounded-lg p-4 mb-4">
+                    <div className="flex items-start gap-3">
+                      <div className="p-1.5 bg-gradient-to-r from-purple-500 to-pink-500 rounded-md">
+                        <HardDrive className="w-4 h-4 text-white" />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-xs text-purple-300 font-semibold mb-2">检测到的磁盘配置</p>
+                        <div className="text-sm text-cyber-text font-mono whitespace-pre-line">
+                          {smartConfigInfo.diskDetails}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 配置方案 */}
+                  <div className="bg-cyber-grid/30 border border-cyber-accent/30 rounded-lg p-4 mb-4">
+                    <div className="flex items-start gap-3">
+                      <div className="p-1.5 bg-gradient-to-r from-cyan-500 to-blue-500 rounded-md">
+                        <Activity className="w-4 h-4 text-white" />
+                      </div>
+                      <div className="flex-1">
+                        <p className="text-xs text-cyan-300 font-semibold mb-2">智能推荐方案</p>
+                        <p className="text-cyber-text font-medium">{smartConfigInfo.scenario}</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* 提示信息 */}
+                  {smartConfigInfo.groupCount >= 2 ? (
+                    <div className="bg-orange-500/10 border border-orange-500/30 rounded-lg p-3 mb-6">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-orange-400 flex-shrink-0 mt-0.5" />
+                        <div className="text-xs text-orange-300">
+                          <p className="font-semibold mb-1">OVH API限制</p>
+                          <p>多磁盘组服务器不支持自定义分区配置。</p>
+                          <p>建议使用默认分区方案进行安装。</p>
+                        </div>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="bg-cyan-500/10 border border-cyan-500/30 rounded-lg p-3 mb-6">
+                      <div className="flex items-start gap-2">
+                        <AlertCircle className="w-4 h-4 text-cyan-400 flex-shrink-0 mt-0.5" />
+                        <p className="text-xs text-cyan-300">
+                          是否应用智能配置？
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 按钮 */}
+                  <div className="flex justify-end gap-3">
+                    <button
+                      onClick={() => setShowSmartConfigDialog(false)}
+                      className="px-6 py-2.5 bg-cyber-grid/50 border border-cyber-accent/30 rounded-lg text-cyber-text hover:bg-cyber-accent/10 transition-all">
+                      {smartConfigInfo.groupCount >= 2 ? '关闭' : '取消'}
+                    </button>
+                    {smartConfigInfo.groupCount < 2 && (
+                      <button
+                        onClick={() => {
+                          applySmartConfig();
+                          setShowSmartConfigDialog(false);
+                        }}
+                        className="px-6 py-2.5 bg-gradient-to-r from-cyan-500 to-purple-500 text-white rounded-lg hover:from-cyan-600 hover:to-purple-600 transition-all shadow-lg shadow-cyan-500/20 flex items-center gap-2">
+                        <Check className="w-4 h-4" />
+                        确定
+                      </button>
+                    )}
                   </div>
                 </div>
               </motion.div>
