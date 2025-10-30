@@ -248,7 +248,14 @@ const ServerControlPage: React.FC = () => {
       }
     } catch (error: any) {
       console.error('获取BIOS设置失败:', error);
-      showToast({ title: '获取BIOS设置失败', type: 'error' });
+      if (error?.response?.status === 404) {
+        // 该服务器不支持 BIOS 设置
+        setBiosSettings({});
+        setBiosSgx(null);
+        showToast({ title: '该服务器不支持 BIOS 设置', type: 'info' });
+      } else {
+        showToast({ title: '获取BIOS设置失败', type: 'error' });
+      }
     } finally {
       setLoadingBios(false);
     }

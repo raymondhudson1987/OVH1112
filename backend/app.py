@@ -9,6 +9,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import ovh
+from ovh.exceptions import APIError as OvhAPIError
 import re
 import traceback
 import requests
@@ -643,7 +644,7 @@ def check_server_availability(plan_code, options=None):
                             result[datacenter_name] = "unavailable"
                         else:
                             result[datacenter_name] = availability
-                
+
                 add_log("INFO", f"配置 {matched_config.get('fqn')} 的可用性: {result}")
                 return result
             else:
@@ -678,7 +679,6 @@ def check_server_availability(plan_code, options=None):
         add_log("ERROR", f"Failed to check availability for {plan_code}: {str(e)}")
         add_log("ERROR", f"Traceback: {traceback.format_exc()}")
         return None
-
 # Purchase server
 def purchase_server(queue_item):
     client = get_ovh_client()
@@ -1157,7 +1157,6 @@ def start_auto_refresh_cache():
     thread.daemon = True
     thread.start()
     add_log("INFO", "自动刷新缓存线程已启动", "auto_refresh")
-
 # Load server list from OVH API
 def load_server_list():
     global config
@@ -1852,7 +1851,6 @@ def load_server_list():
                                     add_log("INFO", f"从properties提取带宽: {value} 给 {plan_code}")
             except Exception as e:
                 add_log("WARNING", f"解析 {plan_code} 属性时出错: {str(e)}")
-            
             # 解析方法 2: 尝试从名称中提取信息
             try:
                 server_name = server_info["name"]
@@ -2618,7 +2616,6 @@ def set_monitor_interval():
         return jsonify({"status": "success", "message": f"检查间隔已设置为 {interval} 秒"})
     else:
         return jsonify({"status": "error", "message": "设置失败，间隔不能小于60秒"}), 400
-
 @app.route('/api/telegram/set-webhook', methods=['POST'])
 def set_telegram_webhook():
     """
@@ -3139,7 +3136,6 @@ def _convert_display_dc_to_api_dc(datacenter):
     }
     dc_lower = datacenter.lower()
     return dc_map.get(dc_lower, dc_lower)
-
 def _get_server_price_internal(plan_code, datacenter='gra', options=None):
     """
     内部函数：获取配置后的服务器价格（不实际下单）
@@ -3315,7 +3311,7 @@ def _get_server_price_internal(plan_code, datacenter='gra', options=None):
                     currency_from_with_tax = with_tax_obj.get("currencyCode")
                     if currency_from_with_tax:
                         price_info["prices"]["currencyCode"] = currency_from_with_tax
-                
+            
                 if not price_info["prices"]["currencyCode"]:
                     price_info["prices"]["currencyCode"] = prices_dict.get("currencyCode", "EUR") if isinstance(prices_dict, dict) else "EUR"
             elif prices_dict is not None:
@@ -3917,7 +3913,6 @@ def handle_pending_match_task(task):
             )
     else:
         add_log("DEBUG", f"待匹配任务 {task['api1_planCode']} 暂无新增", "config_sniper")
-
 def check_and_queue_plancode(api2_plancode, task, bound_config, client):
     """检查单个 planCode 的可用性并加入队列
     使用新的配置匹配逻辑：内存提取前两段，存储前缀匹配
@@ -4633,7 +4628,6 @@ def install_os(service_name):
     except Exception as e:
         add_log("ERROR", f"重装服务器 {service_name} 系统失败: {str(e)}", "server_control")
         return jsonify({"success": False, "error": str(e)}), 500
-
 # 安装步骤中文翻译
 def translate_install_step(comment):
     """将OVH API返回的英文步骤翻译成中文"""
@@ -5418,7 +5412,6 @@ def hardware_replace(service_name):
             "success": False,
             "error": error_msg
         }), 500
-
 @app.route('/api/server-control/<service_name>/network-interfaces', methods=['OPTIONS', 'GET'])
 def get_network_interfaces(service_name):
     """获取物理网卡列表（NetworkInterfaceController）"""
@@ -6139,6 +6132,14 @@ def get_server_bios_settings(service_name):
             "success": True,
             "bios": bios
         })
+    except OvhAPIError as e:
+        message = str(e)
+        # OVH 返回对象不存在 -> 此服务器不支持 BIOS 设置 API
+        if 'does not exist' in message or 'object' in message.lower():
+            add_log("WARNING", f"[BIOS] 服务器 {service_name} 不支持 BIOS 设置: {message}", "server_control")
+            return jsonify({"success": False, "error": "BIOS 设置不可用"}), 404
+        add_log("ERROR", f"[BIOS] API错误: {message}", "server_control")
+        return jsonify({"success": False, "error": message}), 502
     except Exception as e:
         add_log("ERROR", f"[BIOS] 获取BIOS设置失败: {str(e)}", "server_control")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -6160,10 +6161,16 @@ def get_server_bios_settings_sgx(service_name):
             "success": True,
             "sgx": sgx
         })
+    except OvhAPIError as e:
+        message = str(e)
+        if 'does not exist' in message or 'object' in message.lower():
+            add_log("WARNING", f"[BIOS] 服务器 {service_name} 不支持 SGX: {message}", "server_control")
+            return jsonify({"success": False, "error": "SGX 不可用"}), 404
+        add_log("ERROR", f"[BIOS] SGX API错误: {message}", "server_control")
+        return jsonify({"success": False, "error": message}), 502
     except Exception as e:
-        # 某些服务器不支持 SGX，返回 404 友好提示
-        add_log("WARNING", f"[BIOS] 服务器 {service_name} 不支持 SGX: {str(e)}", "server_control")
-        return jsonify({"success": False, "error": "SGX 不可用"}), 404
+        add_log("ERROR", f"[BIOS] 获取SGX失败: {str(e)}", "server_control")
+        return jsonify({"success": False, "error": str(e)}), 500
 
 def check_vps_datacenter_availability(plan_code, ovh_subsidiary="IE"):
     """
@@ -6201,7 +6208,6 @@ def check_vps_datacenter_availability(plan_code, ovh_subsidiary="IE"):
     except Exception as e:
         add_log("ERROR", f"检查VPS可用性时出错: {str(e)}", "vps_monitor")
         return None
-
 def send_vps_summary_notification(plan_code, datacenters_list, change_type):
     """
     发送VPS库存变化汇总通知（多个数据中心）
