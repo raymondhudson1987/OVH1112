@@ -283,13 +283,17 @@ const ServerControlPage: React.FC = () => {
     const singleDiskGB = calculateTotalDiskCapacity();
     const diskCount = Object.values(diskGroups)[0]?.disks?.length || 2;
     
+    let theoreticalCapacity = 0;
     if (zfsRaidLevel === 0) {
       // RAID0: 所有磁盘容量相加
-      return singleDiskGB * diskCount;
+      theoreticalCapacity = singleDiskGB * diskCount;
     } else {
       // RAID1: 只有一块盘的容量
-      return singleDiskGB;
+      theoreticalCapacity = singleDiskGB;
     }
+    
+    // 实际可用容量约为理论容量的 92% (磁盘厂商GB vs 实际GiB差异)
+    return Math.floor(theoreticalCapacity * 0.92);
   };
   const [installCompleted, setInstallCompleted] = useState(false); // 标记安装是否已完成
   const [autoCloseCountdown, setAutoCloseCountdown] = useState(8); // 自动关闭倒计时

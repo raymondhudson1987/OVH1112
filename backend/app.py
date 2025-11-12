@@ -4724,9 +4724,13 @@ def install_os(service_name):
             
             # 计算根目录大小
             # 减去: /boot(1GB) + swap(8GB) + /var/lib/vz
-            total_capacity_mb = total_capacity_gb * 1024
+            # 注意: 磁盘厂商的GB和实际GiB有差异，需要预留10%安全余量
+            # 480GB 磁盘实际约 438GB 可用
+            usable_capacity_mb = int(total_capacity_gb * 1024 * 0.92)  # 预留8%空间
             boot_swap_mb = 1024 + 8192  # 9GB
-            root_size_mb = total_capacity_mb - boot_swap_mb - vz_size_mb
+            root_size_mb = usable_capacity_mb - boot_swap_mb - vz_size_mb
+            
+            add_log("INFO", f"💾 容量计算: 理论{total_capacity_gb}GB, 实际可用~{usable_capacity_mb//1024}GB, 根目录{root_size_mb//1024}GB", "server_control")
             
             # Proxmox 强制要求独立的 /var/lib/vz 分区
             install_params['storage'] = [
