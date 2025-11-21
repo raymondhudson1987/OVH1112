@@ -45,3 +45,7 @@ services:
 networks:
   ovh-network:
     driver: bridge
+
+volumes:
+      - ./frontend:/app        
+      - /app/node_modules    
